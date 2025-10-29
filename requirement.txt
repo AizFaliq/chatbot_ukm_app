@@ -1,0 +1,4 @@
+langchain_community
+langchain_huggingface
+lmstudio
+pandas
