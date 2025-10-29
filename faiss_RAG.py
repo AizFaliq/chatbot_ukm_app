@@ -40,9 +40,9 @@ def detect_q_type(q: str) -> str:
     return "OPEN"
 
 def split_candidates(text: str):
-    # split by ., ;, , or newlines; keep order; trim; drop empties
     parts = re.split(r'[.;,\n]+', text)
     parts = [p.strip() for p in parts if p.strip()]
+    parts = clean_tokens(parts)
     return parts
 
 def is_listy_text(text: str) -> bool:
@@ -118,37 +118,93 @@ def enforce_output_mode(answer: str, output_mode: str, fallback_items=None) -> s
 
     return answer.strip()
 
+QA_LINE = re.compile(r'^\s*(soalan|jawapan)\s*:\s*', re.I)
+
+def clean_tokens(items):
+    cleaned = []
+    for t in items:
+        t = t.strip()
+        if not t or re.fullmatch(r'[-–—]+', t):  # drop '---' etc.
+            continue
+        t = QA_LINE.sub('', t)  # drop "Soalan:" / "Jawapan:"
+        if t.lower() in {"soalan", "jawapan", "konteks", "rujukan"}:
+            continue
+        cleaned.append(t)
+    return cleaned
+
+def extract_answer_terms_from_doc(page_text):
+    """
+    Prefer terms after 'Jawapan:' in the PRIMARY doc.
+    Split by commas/semicolons/newlines, keep short noun-ish chunks.
+    """
+    m = re.search(r'jawapan\s*:\s*(.*)', page_text, flags=re.I|re.S)
+    if not m:
+        return []
+    ans_block = m.group(1)
+    # stop at next 'Soalan:' if present
+    ans_block = re.split(r'\bSoalan\s*:', ans_block, flags=re.I)[0]
+    parts = re.split(r'[,\n;]+', ans_block)
+    parts = [p.strip() for p in parts if p.strip()]
+    parts = clean_tokens(parts)
+    # keep compact items (<= 4 words)
+    parts = [p for p in parts if 1 <= len(p.split()) <= 4]
+    # title-case single nouns like "kubus", keep acronyms as-is
+    norm = []
+    for p in parts:
+        if p.isupper():
+            norm.append(p)
+        else:
+            norm.append(p.capitalize())
+    # de-dup preserve order
+    seen, out = set(), []
+    for it in norm:
+        key = it.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
 def query_rag(query_text: str, db, model, k=5, score_threshold=0.6, max_docs=2):
-    """
-    Narrower context to avoid echoing multiple Q/A blocks:
-    - Keep only docs under threshold; if none, fallback to top-1.
-    - Cap context at max_docs (default 2).
-    - Everything else stays the same as your current pipeline.
-    """
-    # 1) Retrieve & sort (lower score = better for FAISS cosine distance)
     results = db.similarity_search_with_score(query_text, k=k)
     if not results:
         return ("Maaf, tiada rujukan ditemui untuk soalan ini dalam pangkalan ilmu.", [])
 
+    # lower score = better (cosine distance)
     results = sorted(results, key=lambda x: x[1])
 
-    # 2) Filter by threshold; fallback to best single hit if nothing passes
     filtered = [(doc, score) for doc, score in results if score <= score_threshold]
     if not filtered:
-        filtered = [results[0]]  # strict fallback to top-1
-
-    # 3) Cap to a small number of docs to keep context tight
+        filtered = [results[0]]  # fallback to top-1
     filtered = filtered[:max_docs]
 
-    # 4) Build context
+    # PRIMARY doc used for deterministic extraction
+    primary_doc, primary_score = filtered[0]
+
     context_text = "\n\n---\n\n".join([doc.page_content for doc, _ in filtered])
 
-    # 5) Heuristics (unchanged)
+    # Heuristics
     q_type = detect_q_type(query_text)
     output_mode = decide_output_mode(q_type, context_text)
     rules = rendering_directive(output_mode)
 
-    # Deterministic fast-path for listy context
+    # 🔒 Deterministic path for "apakah ... jenis|bentuk|kategori"
+    ql = query_text.strip().lower()
+    wants_terms = (
+        ql.startswith("apakah")
+        and ((" jenis" in ql) or (" bentuk" in ql) or (" kategori" in ql))
+    )
+
+    if output_mode == "list" and wants_terms:
+        terms = extract_answer_terms_from_doc(primary_doc.page_content)
+        if len(terms) >= 3:
+            answer_text = format_numbered(terms)
+            sources = []
+            doc_id = primary_doc.metadata.get("id") or primary_doc.metadata.get("source") or "[no-id]"
+            sources.append(f"{doc_id} (score={primary_score:.3f})")
+            return answer_text, sources
+        # else: fall through to model path
+
+    # Deterministic fast-list if context is listy
     direct_list = None
     if output_mode == "list":
         direct_list = hard_list_from_context(query_text, context_text)
@@ -161,22 +217,20 @@ def query_rag(query_text: str, db, model, k=5, score_threshold=0.6, max_docs=2):
             question=query_text,
             rendering_rules=rules
         )
-        response = model.respond(chat_prompt)  # keep your current LM Studio call
+        response = model.respond(chat_prompt)  # your client call
         answer_text = getattr(response, "content", str(response))
 
-        # Enforce numbered list when required (using your existing function)
         if output_mode == "list":
             fallback_items = [t for t in split_candidates(context_text) if len(t.split()) <= 5]
             answer_text = enforce_output_mode(answer_text, "list", fallback_items=fallback_items)
 
-    # 6) Sources (keep concise; no '+' assumptions)
+    # Sources
     sources = []
     for doc, score in filtered:
         doc_id = doc.metadata.get("id") or doc.metadata.get("source") or "[no-id]"
         sources.append(f"{doc_id} (score={score:.3f})")
 
     return answer_text.strip(), sources
-
 
 
 # --- Main loop ---
@@ -194,7 +248,7 @@ if __name__ == "__main__":
             break
 
         answer, sources = query_rag(query, db, model)
-        print("\n✅ Answer:", answer)
+        print("\n✅ Answer:\n" + answer)
         print("📖 Sources:")
         for s in sources:
             print("   •", s)
